@@ -117,7 +117,12 @@ button:disabled{opacity:.4;cursor:default}
 const SB_URL="https://zgrjmmwimwttnffpskwv.supabase.co";
 const SB_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpncmptbXdpbXd0dG5mZnBza3d2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ1NTYyNzUsImV4cCI6MjExMDEzMjI3NX0.5eYZPtubZ4ojYPRszMeMW1q5hfoaILGciryRG7KpSwg"; // публичный anon-ключ: доступ к таблице закрыт правилами RLS
 const sb=supabase.createClient(SB_URL,SB_KEY);
-const ICE={iceServers:[{urls:"stun:stun.l.google.com:19302"},{urls:"stun:stun1.l.google.com:19302"}]};
+/* STUN + TURN. TURN нужен, когда прямое соединение невозможно (мобильный интернет, Wi-Fi с изоляцией, NAT).
+   Для максимальной надёжности зарегистрируйте свой бесплатный TURN (metered.ca) и замените username/credential. */
+const ICE={iceServers:[
+  {urls:["stun:stun.l.google.com:19302","stun:stun1.l.google.com:19302","stun:stun.cloudflare.com:3478"]},
+  {urls:["turn:openrelay.metered.ca:80","turn:openrelay.metered.ca:443","turns:openrelay.metered.ca:443?transport=tcp"],username:"openrelayproject",credential:"openrelayproject"}
+],iceCandidatePoolSize:4};
 const $=s=>document.querySelector(s);
 const qs=new URLSearchParams(location.search);
 const isPhone=/^[a-z0-9]{6}$/.test(qs.get("c")||"");
@@ -151,7 +156,7 @@ function drawQR(){
 }
 
 /* ---------- PC ---------- */
-let pcc=null,phone=null,pendId=null,pendName="";
+let pcc=null,phone=null,pendId=null,pendName="",preIce=[],connType="",statT=null;
 async function pcInit(){
   $("#pc").classList.remove("hide");status("Создаём сессию…","wait");
   $("#base").value=location.origin+location.pathname;$("#base").oninput=drawQR;
@@ -172,42 +177,65 @@ async function pcInit(){
     $("#modal").classList.remove("on");if(pendId)send({t:"reject",to:pendId});
     setDb("rejected");pendId=null;
   };
-  $("#rv").addEventListener("resize",()=>{const v=$("#rv");$("#res").style.display="block";$("#res").textContent=v.videoWidth+"×"+v.videoHeight});
+  const rv=$("#rv");
+  rv.addEventListener("resize",updRes);
+  rv.addEventListener("playing",()=>{$("#empty").classList.add("hide");$("#live").style.display="block";updRes()});
   $("#fs").onclick=()=>$("#stage").requestFullscreen&&$("#stage").requestFullscreen();
-  $("#mir").onclick=()=>$("#rv").classList.toggle("mir");
-  $("#snd").onclick=()=>{const v=$("#rv");v.muted=!v.muted;$("#snd").textContent=v.muted?"🔇 Звук выкл.":"🔊 Звук вкл."};
+  $("#mir").onclick=()=>rv.classList.toggle("mir");
+  $("#snd").onclick=()=>{rv.muted=!rv.muted;$("#snd").textContent=rv.muted?"🔇 Звук выкл.":"🔊 Звук вкл."};
   $("#bye").onclick=()=>{send({t:"bye",to:phone});resetPC()};
+}
+function updRes(){
+  const v=$("#rv");if(!v.videoWidth)return;
+  $("#res").style.display="block";$("#res").textContent=v.videoWidth+"×"+v.videoHeight+(connType?" · "+connType:"");
+}
+async function checkType(){
+  if(!pcc)return;
+  try{
+    const st=await pcc.getStats();let t="";
+    st.forEach(r=>{if(r.type==="candidate-pair"&&r.nominated&&r.state==="succeeded"){
+      const l=st.get(r.localCandidateId),m=st.get(r.remoteCandidateId);
+      t=(l&&l.candidateType==="relay")||(m&&m.candidateType==="relay")?"через TURN":"напрямую"}});
+    if(t){connType=t;updRes()}
+  }catch(e){}
 }
 async function onPC(m){
   if(m.t==="hello"){
+    if(phone&&m.from===phone&&!pcc){send({t:"accept",to:phone});return}
     if(phone||m.to||(pendId&&pendId!==m.from))return;
     pendId=m.from;pendName=m.name||"Телефон";
     $("#mt").textContent="Устройство «"+String(pendName).slice(0,40)+"» хочет передать видео на этот компьютер.";
     $("#modal").classList.add("on");return;
   }
+  if(m.t==="ice"&&m.to===me&&m.from===phone){if(pcc)addIce(pcc,m.c);else preIce.push(m.c);return}
   if(m.to!==me||m.from!==phone)return;
   if(m.t==="offer"){
-    pcc=makePC(()=>phone,e=>{
-      $("#rv").srcObject=e.streams[0];$("#empty").classList.add("hide");$("#live").style.display="block";
-      RS.forEach(i=>$("#"+i).disabled=false);
-    });
-    pcc.onconnectionstatechange=()=>{const s=pcc&&pcc.connectionState;
-      if(s==="connected"){status("Трансляция идёт","ok");setDb("connected",pendName)}
-      else if(s==="failed"||s==="disconnected")status("Связь потеряна","bad")};
+    if(!pcc){
+      pcc=makePC(()=>phone,e=>{
+        const v=$("#rv");v.srcObject=e.streams[0];v.play().catch(()=>{});
+        RS.forEach(i=>$("#"+i).disabled=false);
+      });
+      pcc.pend.push(...preIce.splice(0));
+      pcc.onconnectionstatechange=()=>{const s=pcc&&pcc.connectionState;
+        if(s==="connected"){status("Трансляция идёт","ok");setDb("connected",pendName);checkType()}
+        else if(s==="disconnected")status("Восстанавливаем связь…","wait");
+        else if(s==="failed")status("Связь потеряна — переподключаем…","bad")};
+      clearInterval(statT);statT=setInterval(checkType,4000);
+    }
     await pcc.setRemoteDescription(m.sdp);await flush(pcc);
     await pcc.setLocalDescription(await pcc.createAnswer());
     send({t:"answer",to:phone,sdp:pcc.localDescription});
-  }else if(m.t==="ice"&&pcc)addIce(pcc,m.c);
-  else if(m.t==="bye")resetPC();
+  }else if(m.t==="bye")resetPC();
 }
 function resetPC(){
-  if(pcc)pcc.close();pcc=null;phone=null;pendId=null;setDb("waiting");
+  clearInterval(statT);
+  if(pcc)pcc.close();pcc=null;phone=null;pendId=null;preIce=[];connType="";setDb("waiting");
   $("#rv").srcObject=null;$("#empty").classList.remove("hide");$("#live").style.display="none";$("#res").style.display="none";
   RS.forEach(i=>$("#"+i).disabled=true);status("Ждём телефон","wait");
 }
 
 /* ---------- Phone ---------- */
-let stream=null,pp=null,pcId=null,helloT=null,facing="environment";
+let stream=null,pp=null,pcId=null,helloT=null,facing="environment",dcT=null;
 async function phoneInit(){
   $("#pc").classList.add("hide");$("#ph").classList.remove("hide");status("Проверяем сессию…","wait");
   const {data,error}=await sb.rpc("get_session",{p_code:code});
@@ -218,8 +246,10 @@ async function phoneInit(){
   $("#go").onclick=start;$("#stop").onclick=()=>stopAll(true);
 }
 async function start(){
-  try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:facing,width:{ideal:1920},height:{ideal:1080}},audio:true})}
+  const vc={facingMode:facing,width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}};
+  try{stream=await navigator.mediaDevices.getUserMedia({video:vc,audio:{echoCancellation:true,noiseSuppression:true}})}
   catch(e){try{stream=await navigator.mediaDevices.getUserMedia({video:true})}catch(e2){$("#phsub").textContent="Нет доступа к камере. Разрешите её в настройках браузера.";status("Камера недоступна","bad");return}}
+  const vt=stream.getVideoTracks()[0];if(vt&&"contentHint" in vt)vt.contentHint="motion";
   $("#lv").srcObject=stream;$("#pempty").classList.add("hide");$("#go").classList.add("hide");$("#opt").classList.add("hide");$("#stop").classList.remove("hide");
   $("#phsub").textContent="Подключаемся к компьютеру…";status("Подключение…","wait");
   try{await openChannel(onPh)}catch(e){stopAll(false);status("Нет связи с сервером","bad");return}
@@ -228,24 +258,38 @@ async function start(){
   const hello=()=>send({t:"hello",name});hello();helloT=setInterval(hello,2000);
   $("#phsub").textContent="Подтвердите подключение на компьютере…";status("Ждём подтверждения на ПК","wait");
 }
+async function tune(){
+  if(!pp)return;
+  const s=pp.getSenders().find(x=>x.track&&x.track.kind==="video");if(!s)return;
+  try{
+    const p=s.getParameters();if(!p.encodings||!p.encodings.length)p.encodings=[{}];
+    p.encodings[0].maxBitrate=5000000;p.encodings[0].maxFramerate=30;p.degradationPreference="maintain-resolution";
+    await s.setParameters(p);
+  }catch(e){}
+}
 async function onPh(m){
+  if(m.t==="ice"&&m.to===me&&pp&&m.from===pcId){addIce(pp,m.c);return}
   if(m.to!==me)return;
   if(m.t==="accept"&&stream&&!pp){
     clearInterval(helloT);pcId=m.from;
     pp=makePC(()=>pcId,()=>{});
-    pp.onconnectionstatechange=()=>{const s=pp&&pp.connectionState;
-      if(s==="connected"){status("Трансляция идёт","ok");$("#plive").style.display="block";$("#phsub").textContent="Камера передаёт видео на ПК."}
-      else if(s==="failed"||s==="disconnected")status("Связь потеряна","bad")};
+    pp.onnegotiationneeded=async()=>{
+      if(!pp||!pcId)return;
+      try{await pp.setLocalDescription(await pp.createOffer());send({t:"offer",to:pcId,sdp:pp.localDescription})}catch(e){}
+    };
+    pp.onconnectionstatechange=()=>{const s=pp&&pp.connectionState;clearTimeout(dcT);
+      if(s==="connected"){status("Трансляция идёт","ok");$("#plive").style.display="block";$("#phsub").textContent="Камера передаёт видео на ПК.";tune()}
+      else if(s==="disconnected"){status("Восстанавливаем связь…","wait");dcT=setTimeout(()=>{if(pp&&pp.connectionState!=="connected")pp.restartIce()},3000)}
+      else if(s==="failed"){status("Переподключаем…","bad");pp.restartIce()}};
     stream.getTracks().forEach(t=>pp.addTrack(t,stream));
-    await pp.setLocalDescription(await pp.createOffer());
-    send({t:"offer",to:pcId,sdp:pp.localDescription});
-  }else if(m.t==="answer"&&pp&&m.from===pcId){await pp.setRemoteDescription(m.sdp);await flush(pp)}
-  else if(m.t==="ice"&&pp&&m.from===pcId)addIce(pp,m.c);
+  }else if(m.t==="answer"&&pp&&m.from===pcId){
+    if(pp.signalingState==="have-local-offer"){await pp.setRemoteDescription(m.sdp);await flush(pp)}
+  }
   else if(m.t==="reject"){stopAll(false);$("#phsub").textContent="ПК отклонил подключение.";status("Отклонено","bad")}
   else if(m.t==="bye"&&m.from===pcId){stopAll(false);$("#phsub").textContent="ПК завершил сеанс."}
 }
 function stopAll(notify){
-  clearInterval(helloT);
+  clearInterval(helloT);clearTimeout(dcT);
   if(notify){if(pcId)send({t:"bye",to:pcId});setDb("ended")}
   if(pp)pp.close();pp=null;pcId=null;closeChannel();
   if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;
